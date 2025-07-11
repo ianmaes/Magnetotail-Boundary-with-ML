@@ -220,7 +220,6 @@ class LoadArtemis():
         
         return instrument_to_dataset_map[instrument_name]
 
-    
     def update_naming(self, old_name, name_type='new') -> str:
         # Map names from old to new format and vice versa
         if name_type == 'new':
@@ -246,7 +245,6 @@ class LoadArtemis():
         else:
             raise ValueError(f"Invalid name_type '{name_type}'. Use 'new' or 'old'.")
             
-    
     def legacy_naming(self, new_name):
         # Map new variable names to old one
         for key, value in self.name_map.items():
@@ -271,14 +269,6 @@ class LoadArtemis():
 
         return data_dict
 
-    def plot(self, variable_name):
-
-        legacy_name = self.legacy_naming(variable_name)
-        if legacy_name is None:
-            raise ValueError(f"Variable name '{variable_name}' not found in the mapping.")
-
-        pyspedas.tplot(legacy_name)
-
     def convert_min_delta(self, var_name, start_time=None, end_time=None, time_delta=None) -> dict:
         """
         Convert Spectrogram data to a uniform time delta, removing NaN rows and interpolating single NaN values.
@@ -301,8 +291,7 @@ class LoadArtemis():
         # Check what type of data it is
         var_type = self.data[var_name]['metadata']['CDF']['VATT']['PROPERTY']
 
-        print('here')
-
+        print(f"Preprocessing {var_name}")
         # Convert the data to a uniform time delta
         self.data[var_name]['data'] = data_cleaning.convert_min_delta(
             self.data[var_name]['data'],
@@ -369,7 +358,6 @@ class LoadArtemis():
                 # Remove the variable from the data dictionary
                 del self.data[var_name]
                 print(f"Variable '{var_name}' contains only NaN values and has been removed.")
-
 
     def set_time_delta_spectrograms(self, start_time, end_time, method='min') -> float:
         """
@@ -454,15 +442,25 @@ class LoadArtemis():
             grp.attrs['start_time'] = str(self.start_time)
             grp.attrs['end_time'] = str(self.end_time)
             grp.attrs['creation_date'] = datetime.now().isoformat()
+ 
+            if var_name.startswith('B_'):
+                grp.attrs['data_origin'] = 'Themis_B'
+            elif var_name.startswith('C_'):
+                grp.attrs['data_origin'] = 'Themis_C'
+            else:
+                grp.attrs['data_origin'] = 'Unknown'
             
             # Store times as a separate dataset (only once)
             times_stored = False
             
             # Store each variable's 'y' data in the session group
             for var_name, var_data in self.data.items():
+                if var_name.startswith('B_') or var_name.startswith('C_'):
+                    var_storage_name = var_name[2:]
+                    
                 if 'y' in var_data['data']:
                     # Store the 'y' data array
-                    grp.create_dataset(var_name, data=var_data['data']['y'])
+                    grp.create_dataset(var_storage_name, data=var_data['data']['y'])
                     
                     # Store additional metadata as attributes
                     var_dataset = grp[var_name]
@@ -480,5 +478,75 @@ class LoadArtemis():
             
             print(f"Data saved to {filename} in group {session_id}")
 
+    ### Plotting Methods ###
 
-    
+    # Does not update with preprocessing!!! ###
+    def plot_pyspedas(self, variable_name):
+
+        legacy_name = self.legacy_naming(variable_name)
+        if legacy_name is None:
+            raise ValueError(f"Variable name '{variable_name}' not found in the mapping.")
+
+        pyspedas.tplot(legacy_name)
+
+    # Updates with preprocessing, so preferably use this method
+    def plot_electron_spectrogram(self, times=None, energy=None, figsize=(10, 4), vmin=None, vmax=None, norm='Log', title=None, variable_name='B_ion_eflux'):
+        """
+        Plot electron spectrogram using the loaded data.
+
+        Parameters:
+            times (np.ndarray): Time stamps for the spectrogram.
+            energy (np.ndarray): Energy bins for the spectrogram.
+            figsize (tuple): Size of the figure.
+            vmin (float): Minimum value for color normalization.
+            vmax (float): Maximum value for color normalization.
+            norm (str): Normalization type ('Log' or 'Linear').
+            title (str): Title of the plot.
+        """
+        electron_data = self.data[variable_name]['data']['y']
+        plot_electron_spectrogram(electron_data, times=times, energy=energy, figsize=figsize, vmin=vmin, vmax=vmax, norm=norm, title=title)
+
+    def plot_variables(self, figsize=(10,4), variable_names=None):
+
+        fig, axs = plt.subplots(len(variable_names), 1, figsize=figsize)
+        
+        # Ensure axs is always iterable
+        if len(variable_names) == 1:
+            axs = [axs]
+        
+        for i in range(len(variable_names)):
+            variable_name = variable_names[i]
+
+            # Extract data
+            variable_data = self.data[variable_name]['data']['y']
+            variable_times = self.data[variable_name]['data']['times']
+
+            # Convert to displayable format
+            time_ns = variable_times.astype('int64')
+            time_s = time_ns / 1e9
+            time = mdates.date2num([datetime.fromtimestamp(ts, timezone.utc) for ts in time_s])
+
+            # Check if the variable data is a vector
+            if variable_data.ndim > 1:
+                # If it's a vector, plot each component separately
+                for j in range(variable_data.shape[1]):
+                    axs[i].plot(time, variable_data[:, j], label=f'Component {j+1}')
+                axs[i].legend()
+            else:
+                # If it's a scalar, plot it directly
+                axs[i].plot(time, variable_data, label=variable_name)
+
+            # Set time formatter
+            axs[i].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M\n%d-%b-%Y'))
+            axs[i].xaxis_date()
+            axs[i].set_xlabel('Time')
+            axs[i].set_ylabel(variable_name)
+
+            axs[i].plot(time, variable_data)
+
+        fig.autofmt_xdate()
+        plt.tight_layout()
+        plt.grid()
+        plt.show()   
+
+

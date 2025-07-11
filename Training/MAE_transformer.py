@@ -1,5 +1,4 @@
 import torch
-
 import math
 
 import torch.nn as nn
@@ -284,8 +283,6 @@ class MAETransformer(nn.Module):
         self.register_buffer('normalization_std', std)
         
         return mean, std
-
-    
 
     def prepare_data(self, data, data_type='B_ion_eflux', test_fraction=0.15, norm_mode='new', storage_mode='combined', rand_perm=True, averaging=True):
         """

@@ -199,7 +199,8 @@ def convert_min_delta_vector(data, start_time=None, end_time=None, time_delta=No
                 # Interpolates the vector data
 
                 new_vector[:, i] = np.interp(new_time_float, times_float[valid_mask], y_col[valid_mask])
-                
+
+            
         else:
             raise ValueError(f"Not enough valid points to interpolate for index {i}")
 
@@ -273,6 +274,9 @@ def convert_min_delta_scalar(data, start_time=None, end_time=None, time_delta=No
         if not use_mean:
             # If there are not enough valid points, use linear interpolation
             new_scalar = np.interp(new_time_float, times_float[valid_mask], data['y'][valid_mask])
+
+        if use_mean:
+            print("Used mean for variable")   
     else:
         raise ValueError(f"Not enough valid points to interpolate")
 

@@ -67,7 +67,7 @@ class MagnetotailDataset(Dataset):
                 
                 # Get variables in this session
                 session_vars = [k for k in session_group.keys()]
-                
+
                 # Filter variables if specified
                 if variables is not None:
                     session_vars = [v for v in session_vars if v in variables]
@@ -81,6 +81,7 @@ class MagnetotailDataset(Dataset):
                     'id': session_id,
                     'start_time': session_group.attrs.get('start_time', ''),
                     'end_time': session_group.attrs.get('end_time', ''),
+                    'data_origin': session_group.attrs.get('data_origin', 'Unknown'),
                     'num_timestamps': len(times),
                     'variables': session_vars
                 })
