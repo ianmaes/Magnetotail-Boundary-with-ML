@@ -103,7 +103,7 @@ class DoubleTransformer(nn.Module):
         
         return train_loss_tail, test_loss_tail, train_loss_sheath, test_loss_sheath
 
-    def predict(self, data, data_type='B_ion_eflux'):
+    def predict(self, data, data_type='ion_eflux'):
         # Use one of the models to prepare the data
         # This ensures consistent data preparation (both models have same normalization parameters)
         prepared_data, _ = self.transformer_magnetosheath.prepare_data(data, 

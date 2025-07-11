@@ -261,7 +261,7 @@ class MAETransformer(nn.Module):
         
         return self, loss_list, test_loss_list
     
-    def calculate_mean_std(self, data, data_type='B_ion_eflux'):
+    def calculate_mean_std(self, data, data_type='ion_eflux'):
         """
         Calculate mean and standard deviation for normalization.
         """
@@ -284,7 +284,7 @@ class MAETransformer(nn.Module):
         
         return mean, std
 
-    def prepare_data(self, data, data_type='B_ion_eflux', test_fraction=0.15, norm_mode='new', storage_mode='combined', rand_perm=True, averaging=True):
+    def prepare_data(self, data, data_type='ion_eflux', test_fraction=0.15, norm_mode='new', storage_mode='combined', rand_perm=True, averaging=True):
         """
         Prepare data for MAE transformer training.
         """

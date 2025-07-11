@@ -361,13 +361,13 @@ class MagnetotailDataset(Dataset):
 
         self.trainable_samples = result
 
-        if write_to_file:
-            # Store section keys with section indices
-            with h5py.File(self.hdf5_file, 'w') as h5f:
+        # if write_to_file:
+        #     # Store section keys with section indices
+        #     with h5py.File(self.hdf5_file, 'w') as h5f:
 
                 
-                if session_id in h5f:
-                    del h5f[session_id]
+        #         if session_id in h5f:
+        #             del h5f[session_id]
 
         return result
 
