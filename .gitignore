@@ -1,5 +1,15 @@
 # Downloaded data
 Data/cdaweb/*
+Data/generation_data/*
+Data/testing_data/*
+Data/training_data/*
+Data/themis_data/*
+Helper/cdaweb/*
+Helper/omni_data/*
+Training/cdaweb/*
+Training/generation_data/*
+Training/omni_data/*
+Training/models/*
 
-# Leftover's (to be removed)
+# Leftovers (to be removed)
 Data/themis_data
