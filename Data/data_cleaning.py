@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 import scipy as sp
 
-
 def convert_min_delta(data, start_time=None, end_time=None, type='scalar', time_delta=None) -> dict:
     """
     Convert data to a uniform time delta, removing NaN rows and interpolating single NaN values.
@@ -62,7 +61,7 @@ def convert_min_delta_spectrogram(data, start_time=None, end_time=None, time_del
     """
 
     # Remove all NaN rows from the spectrogram
-    data = remove_nan_rows(data)
+    data = remove_nan_columns(data)
 
     # Convert numpy.datetime64 objects to timestamps (seconds since epoch)
     times_dt = data['times']
@@ -75,11 +74,11 @@ def convert_min_delta_spectrogram(data, start_time=None, end_time=None, time_del
 
     if time_delta is None:
         # Create a new time array with the minimum time difference
-        new_time_float = np.arange(time_i, time_f, min_time_diff)
+        new_time_float = np.arange(start_time.astype(float), end_time.astype(float), min_time_diff)
 
     else:
         # Create a new time array with the specified time delta
-        new_time_float = np.arange(time_i, time_f, time_delta)
+        new_time_float = np.arange(start_time.astype(float), end_time.astype(float), time_delta)
 
     # Interpolate the spectrogram data to match the new time array
     new_spectrogram = np.empty((len(new_time_float), data['y'].shape[1]))
@@ -153,7 +152,7 @@ def convert_min_delta_vector(data, start_time=None, end_time=None, time_delta=No
         time_delta = min_time_diff
 
     # Create a new time array with the specified time delta
-    new_time_float = np.arange(time_i, time_f, time_delta)
+    new_time_float = np.arange(start_time.astype(float), end_time.astype(float), time_delta)
 
     # Create empty array for the new vector data
     new_vector = np.empty((len(new_time_float), data['y'].shape[1]))
@@ -241,7 +240,7 @@ def convert_min_delta_scalar(data, start_time=None, end_time=None, time_delta=No
         time_delta = min_time_diff
         
     # Create a new time array with the specified time delta
-    new_time_float = np.arange(time_i, time_f, time_delta)
+    new_time_float = np.arange(start_time.astype(float), end_time.astype(float), time_delta)
 
     # Create empty array for the new vector data
     new_scalar = np.empty(len(new_time_float))
@@ -255,28 +254,28 @@ def convert_min_delta_scalar(data, start_time=None, end_time=None, time_delta=No
     # Interpolate only if there are valid points
     if np.sum(valid_mask) > 1:
 
-        use_mean = True
-
+        # Initialize new_scalar with NaNs
         new_scalar = np.empty(len(new_time_float))
+        new_scalar[:] = np.nan
+
         # Check how many data points are contained within one time delta. If more than two for every timestamp, use means
         for i in range(len(new_time_float)):
+
             # Find the indices of the valid points that are within the current time delta
             valid_indices = np.where((times_float[valid_mask] >= new_time_float[i] - time_delta / 2) & 
                                      (times_float[valid_mask] < new_time_float[i] + time_delta / 2))[0]
             
-            if len(valid_indices) < 2:
-                use_mean = False
-            
-            else:
+            # Check if there are at least two valid points to take the mean
+            if len(valid_indices) >= 2:
+
                 # If there are valid points, use the mean of the valid points
                 new_scalar[i] = np.mean(data['y'][valid_mask][valid_indices])
 
-        if not use_mean:
-            # If there are not enough valid points, use linear interpolation
-            new_scalar = np.interp(new_time_float, times_float[valid_mask], data['y'][valid_mask])
+        # Get all indices where new_scalar is still empty (i.e. there were not enough valid points to take the mean)
+        empty_indices = np.where(np.isnan(new_scalar))[0]
 
-        if use_mean:
-            print("Used mean for variable")   
+        # Interpolate these indices using linear interpolation
+        new_scalar[empty_indices] = np.interp(new_time_float[empty_indices], times_float[valid_mask], data['y'][valid_mask]) 
     else:
         raise ValueError(f"Not enough valid points to interpolate")
 
@@ -396,12 +395,26 @@ def find_max_time_diff(times_dt, start_time=None, end_time=None):
     return max_time_diff, time_i, time_f, times_float
 
 def remove_nan_rows(data):
-    # Remove all NaN rows from the spectrogram 
-    mask = ~np.isnan(data['y']).all(axis=0)
-    data['y'] = data['y'][:, mask]
+    """
+    Remove all columns (energy bins) from the spectrogram where:
+    - All values are NaN, or
+    - The column has more than 12 NaN values.
+    """
+    y = data['y']
 
-    # Remove energy bins with all NaN values
-    data['v'] = data['v'][:, mask]
+    # Condition 1: Columns that are all NaN
+    mask_not_all_nan = ~np.all(np.isnan(y), axis=1)
+    # Condition 2: Columns with more than 12 NaNs
+    mask_nan_count = np.sum(np.isnan(y), axis=1) <= 12
+
+    # Combine both masks (keep columns that satisfy both conditions)
+    mask = mask_not_all_nan & mask_nan_count
+
+    # Apply the mask to the spectrogram data
+    data['y'] = data['y'][mask, :]
+    # Apply the mask to the energy bins
+    data['v'] = data['v'][mask, :]
+    data['times'] = data['times'][mask]
 
     return data
 
@@ -413,3 +426,27 @@ def interpolate_nan_columns(data):
                                     data['y'][~np.isnan(data['y'][:, i]), i])
     return data
 
+def remove_nan_columns(data):
+    """
+    Remove all columns (that contain only 0's, Inf's, or NaN's) from the spectrogram data.
+    Also remove every column that has more than 10 NaNs (independent condition).
+    """
+
+    y = data['y']
+
+    # Condition 1: Columns that are all NaN, zero, or Inf
+    mask_valid = ~np.all(np.isnan(y) | (y == 0) | np.isinf(y), axis=0)
+
+    # # Condition 2: Columns with more than 10 NaNs
+    # mask_nan_count = np.sum(np.isnan(y), axis=0) <= 10
+
+    # Combine both masks (keep columns that satisfy both conditions)
+    mask = mask_valid 
+
+    # Apply the mask to the spectrogram data
+    data['y'] = data['y'][:, mask]
+
+    # Apply the mask to the energy bins
+    data['v'] = data['v'][:, mask]
+
+    return data
