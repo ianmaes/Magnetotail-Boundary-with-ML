@@ -1,18 +1,21 @@
 import sys
-from pathlib import Path
-sys.path.append(str(Path().resolve().parent))
-
 import os
+from pathlib import Path
+sys.path.append(str(Path().resolve()))
+sys.path.append(str(Path().resolve().parent))
+sys.path.append(os.path.dirname(__file__))  # adds current folder
+
 import h5py
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from typing import List, Dict, Union, Tuple, Optional
+from torch.utils.data import Dataset
+from typing import List, Optional
 from pathlib import Path
 from Data.data_class import plot_electron_spectrogram
-import matplotlib
-import matplotlib.pyplot as plt
-from IPython.display import display, clear_output
+from IPython.display import clear_output
+from tqdm import tqdm
+
+from Helper.preprocess_functions import remove_outliers_with_local_interpolation, downweight_variable, remove_outliers_with_interpolation
 
 class MagnetotailDataset(Dataset):
     """
@@ -47,10 +50,348 @@ class MagnetotailDataset(Dataset):
         self.initial_cutoffs = []
         self.final_cutoffs = []
         self.trainable_samples = None
+        self.skip_calculations = False
+        # Load section to region map if it exists
+        self.section_to_region_map = self._load_section_to_region_map()
+
+        # Initialize sections
+        self.set_trainable_samples(write_to_file=False)
+
+        if self.skip_calculations:
+            print("Skipping further calculations due to previous warnings.")
+            return
+
+        # Compute plasma beta for each sample
+        self._compute_plasma_beta()
+        self._extract_magnetic_field_x()
+        self._compute_magnetic_field_magnitude()
+        self._compute_velocity_magnitude()
+        self._extract_velocity_x()
         
+    def _compute_plasma_beta(self):
+        """
+        Compute plasma beta for each sample in the dataset.
+        
+        Returns:
+            List of plasma beta values for each sample, and stores the results as a new variable in the dataset.
+        """
+
+        trainable_samples = self.get_trainable_samples()
+
+        print("Computing plasma beta for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if necessary variables are present
+            if 'ion_avgtemp' in section_data and 'electron_avgtemp' in section_data and 'ion_density' in section_data and 'electron_density' in section_data:
+                
+                # Get the necessary variables and convert to SI units
+                ion_avgtemp      = section_data['ion_avgtemp'] * 1.60218e-19         # eV to SI units (J)
+                electron_avgtemp = section_data['electron_avgtemp'] * 1.60218e-19    # eV to SI units (J)
+                ion_density      = section_data['ion_density'] * 10 ** 6             # n per cm^-3 to SI units (m^-3)
+                electron_density = section_data['electron_density'] * 10 ** 6        # n per cm^-3 to SI units (m^-3)
+
+                # Remove outliers of all variables
+                ion_avgtemp      = remove_outliers_with_local_interpolation(ion_avgtemp, 2)
+                electron_avgtemp = remove_outliers_with_local_interpolation(electron_avgtemp, 2)
+                ion_density      = remove_outliers_with_local_interpolation(ion_density, 2)
+                electron_density = remove_outliers_with_local_interpolation(electron_density, 2)
+
+                # Get the total magnetic field strength in Tesla
+                if 'magnetic_field_gsm' in section_data:
+
+                    # Get magnetic field in GSM coordinates
+                    magnetic_field = section_data['magnetic_field_gsm']
+
+                    # Compute total magnetic field strength: |B| = sqrt(Bx^2 + By^2 + Bz^2)
+                    B_total = torch.sqrt(torch.sum(magnetic_field**2, dim=-1)) * 1e-9  # Convert from nT to T
+
+                    # Remove outliers in the magnetic field data
+                    B_total = remove_outliers_with_local_interpolation(B_total, 2)
+
+                    # Downweight the magnetic field variable to reduce noise
+                    B_total, _, _ = downweight_variable(B_total, p=2.0, win=5, smoother_win=15, mode='rational', wmin=0.01, use_forward_diff=True)
+
+                    # Minimum threshold for B_total in Tesla
+                    min_B = 3e-9  
+
+                    # Set a minimum threshold for B_total to avoid division by zero
+                    B_total = torch.where(B_total < min_B, torch.tensor(min_B, dtype=B_total.dtype, device=B_total.device), B_total)
+
+
+                μ_0 = 4 * np.pi * 1e-7  # Permeability of free space in T*m/A
+                k_b = 1.380649e-23      # Boltzmann constant in J/K (unused here, but included for completeness)
+
+                # Calculate plasma beta: β = n * T / (B^2 / (2 * μ_0))
+                plasma_beta = (ion_density * ion_avgtemp + electron_density * electron_avgtemp) / (B_total**2 / (2 * μ_0))
+
+
+                if len(plasma_beta) == 1:
+                    print(f"Warning: Plasma beta calculation resulted in a single value for section {section_key}. This may indicate insufficient data points.")
+
+                # Remove outliers in the magnetic field data
+                plasma_beta = remove_outliers_with_local_interpolation(plasma_beta, window_size=50, n_std=2)
+
+                # Store plasma beta in the section data
+                section_data['plasma_beta'] = plasma_beta
+
+                # Downweight plasma beta to reduce noise for logged version
+                plasma_beta, _, _ = downweight_variable(plasma_beta, kappa_pct=80, p=2.0, smoother_win=20, mode='rational', wmin=0.01, use_forward_diff=True)
+
+                # Store logged plasma beta in the section data
+                section_data['log_plasma_beta'] = torch.log10(plasma_beta + 1e-10)
+
+            else:
+                print(f"Missing required variables for plasma beta calculation in section {section_key}. Skipping this section.")
+                section_data['plasma_beta'] = None
+
+    def _extract_magnetic_field_x(self):
+        """
+        Extract the x-component of the magnetic field in GSM coordinates for each sample.
+        
+        Returns:
+            List of magnetic field x-component values for each sample, and stores the results as a new variable in the dataset.
+        """
+
+        trainable_samples = self.get_trainable_samples()
+
+        print("Extracting magnetic field x-component for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if magnetic_field_gsm variable is present
+            if 'magnetic_field_gsm' in section_data:
+
+                # Get magnetic field in GSM coordinates
+                magnetic_field = section_data['magnetic_field_gsm']
+
+                # Extract the x-component (first column)
+                Bx = magnetic_field[:, 0]
+
+            # Store Bx in the section data
+            section_data['magnetic_field_gsm_x'] = torch.abs(Bx)
+
+    def _extract_magnetic_field_y(self):
+        """
+        Extract the y-component of the magnetic field in GSM coordinates for each sample.
+        
+        Returns:
+            List of magnetic field y-component values for each sample, and stores the results as a new variable in the dataset.
+        """
+
+        trainable_samples = self.get_trainable_samples()
+
+        print("Extracting magnetic field y-component for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if magnetic_field_gsm variable is present
+            if 'magnetic_field_gsm' in section_data:
+
+                # Get magnetic field in GSM coordinates
+                magnetic_field = section_data['magnetic_field_gsm']
+
+                # Extract the y-component (second column)
+                By = magnetic_field[:, 1]
+
+                # Store By in the section data
+                section_data['magnetic_field_gsm_y'] = By
+
+            else:
+                print(f"Missing 'magnetic_field_gsm' variable in section {section_key}. Skipping this section.")
+                section_data['magnetic_field_gsm_y'] = None
+
+    def _extract_magnetic_field_z(self):
+        """
+        Extract the z-component of the magnetic field in GSM coordinates for each sample.
+        
+        Returns:
+            List of magnetic field z-component values for each sample, and stores the results as a new variable in the dataset.
+        """
+
+        trainable_samples = self.get_trainable_samples()
+
+        print("Extracting magnetic field z-component for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if magnetic_field_gsm variable is present
+            if 'magnetic_field_gsm' in section_data:
+
+                # Get magnetic field in GSM coordinates
+                magnetic_field = section_data['magnetic_field_gsm']
+
+                # Extract the z-component (third column)
+                Bz = magnetic_field[:, 2]
+
+                # Store Bz in the section data
+                section_data['magnetic_field_gsm_z'] = Bz
+
+            else:
+                print(f"Missing 'magnetic_field_gsm' variable in section {section_key}. Skipping this section.")
+                section_data['magnetic_field_gsm_z'] = None
+
+    def _compute_magnetic_field_magnitude(self):
+        """
+        Compute the magnitude of the magnetic field in GSM coordinates for each sample.
+        
+        Returns:
+            List of magnetic field magnitude values for each sample, and stores the results as a new variable in the dataset.
+        """
+
+        trainable_samples = self.get_trainable_samples()
+
+        print("Computing magnetic field magnitude for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if magnetic_field_gsm variable is present
+            if 'magnetic_field_gsm' in section_data:
+
+                # Get magnetic field in GSM coordinates
+                magnetic_field = section_data['magnetic_field_gsm']
+
+                # Compute total magnetic field strength: |B| = sqrt(Bx^2 + By^2 + Bz^2)
+                B_total = torch.sqrt(torch.sum(magnetic_field**2, dim=-1))
+
+                # Store B_total in the section data
+                section_data['magnetic_field_gsm_magnitude'] = B_total
+
+            else:
+                print(f"Missing 'magnetic_field_gsm' variable in section {section_key}. Skipping this section.")
+                section_data['magnetic_field_gsm_magnitude'] = None
+ 
+    def _compute_velocity_magnitude(self):
+        
+        trainable_samples = self.get_trainable_samples()
+
+        print("Computing ion velocity magnitude for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if magnetic_field_gsm variable is present
+            if 'ion_velocity_gsm' in section_data:
+
+                # Get ion velocity in GSM coordinates
+                ion_velocity = section_data['ion_velocity_gsm']
+
+                # Compute total magnetic field strength: |B| = sqrt(Bx^2 + By^2 + Bz^2)
+                velocity = torch.sqrt(torch.sum(ion_velocity**2, dim=-1))
+
+                # Store B_total in the section data
+                section_data['ion_velocity_magnitude'] = velocity
+
+            else:
+                print(f"Missing 'ion_velocity_gsm' variable in section {section_key}. Skipping this section.")
+                section_data['ion_velocity_magnitude'] = None
+ 
+    def _extract_velocity_x(self):
+        """
+        Extract the x-component of the ion velocity in GSM coordinates for each sample.
+        
+        Returns:
+            List of ion velocity x-component values for each sample, and stores the results as a new variable in the dataset.
+        """
+
+        trainable_samples = self.get_trainable_samples()
+
+        print("Extracting ion velocity x-component for each section...")
+
+        for section_key, section_data in tqdm(trainable_samples.items()):
+            # Check if ion_velocity_gsm variable is present
+            if 'ion_velocity_gsm' in section_data:
+
+                # Get ion velocity in GSM coordinates
+                ion_velocity = section_data['ion_velocity_gsm']
+
+                # Extract the x-component (first column)
+                Vx = ion_velocity[:, 0]
+
+                # Store Vx in the section data
+                section_data['ion_velocity_gsm_x'] = Vx
+
+            else:
+                print(f"Missing 'ion_velocity_gsm' variable in section {section_key}. Skipping this section.")
+                section_data['ion_velocity_gsm_x'] = None
+        
+
+    def _load_section_to_region_map(self, filepath: Optional[str] = None):
+        
+        if filepath is not None:
+            # Load from specified file stored as a numpy .npz file
+            if not os.path.isfile(filepath):
+                raise FileNotFoundError(f"File {filepath} not found.")
+            data = np.load(filepath, allow_pickle=True)
+            section_to_region_map = {key: data[key].item() if data[key].shape == () else data[key].tolist() for key in data.files}
+            return section_to_region_map
+        
+        with h5py.File(self.hdf5_file, 'r') as h5f:
+            # Check if section to region mapping exists
+            if 'section_to_region_map' in h5f.keys():
+                
+                # Read the section to region mapping group
+                section_group = h5f['section_to_region_map']
+                section_to_region_map = {}
+
+                # Iterate through each key in the section group
+                for k, v in section_group.items():
+
+                    # Read dataset content; v[...] reads the data into memory
+                    data = v[()]
+
+                    # Check if the data is scalar or array and decode accordingly
+                    if isinstance(data, bytes):
+                        section_to_region_map[k] = data.decode('utf-8')
+
+                    # if it is an array of bytes, decode each element
+                    elif isinstance(data, (list, tuple, np.ndarray)):
+                        section_to_region_map[k] = [item.decode('utf-8') for item in data]
+
+                    else:
+                        raise ValueError(f"Unexpected data type {type(data)} for key '{k}'")
+                    
+            # If no section to region mapping exists, return an empty dict
+            else:
+                section_to_region_map = {} 
+
+            
+
+        return section_to_region_map
+    
+    def write_section_to_region_map(self):
+        with h5py.File(self.hdf5_file, 'r+') as h5f:
+
+            # If section_to_region_map is not set, try to get it
+            if not self.section_to_region_map:
+                self.section_to_region_map = self.get_section_to_region_map()
+
+            
+
+            # Create a group for section to region mapping
+            if 'section_to_region_map' not in h5f.keys():
+                section_group = h5f.create_group('section_to_region_map')
+            else:
+                section_group = h5f['section_to_region_map']
+                # Clear existing entries
+                for key in list(section_group.keys()):
+                    del section_group[key]
+            
+            # Write each section and its corresponding region
+            for section_key, region in self.section_to_region_map.items():
+                if region is None:
+                    region = 'None'  # Handle None regions
+                section_group.create_dataset(section_key, data=region.encode('utf-8'))
+
+    def save_section_to_region_map(self, filepath: str):
+        """
+        Save the section to region mapping to a specified file in NumPy .npz format.
+        
+        Parameters:
+            filepath (str): Path to the file where the mapping should be saved.
+        """
+        if not self.section_to_region_map:
+            raise ValueError("No section to region mapping found. Please set regions manually or ensure the mapping exists.")
+        
+        # Save the mapping as a .npz file
+        np.savez(filepath, **self.section_to_region_map)
+
     def _load_metadata(self, session_ids=None, variables=None):
         """Load metadata from the HDF5 file and prepare index mapping."""
-        with h5py.File(self.hdf5_file, 'r') as h5f:
+        with h5py.File(self.hdf5_file, 'r+') as h5f:
             # Get available session IDs
             available_sessions = [k for k in h5f.keys() if k.startswith('session_')]
             
@@ -60,8 +401,26 @@ class MagnetotailDataset(Dataset):
             
             # Process each session
             for session_id in available_sessions:
-                session_group = h5f[session_id]
-                
+
+                # Check if 'times' variable exists, if not, remove the session
+                # This is to ensure that we only work with sessions that have valid timestamps
+                while 'times' not in h5f[session_id]:
+                    
+                    # If 'times' is missing, print a warning and remove the session
+                    print(f"Warning: Session does not contain 'times' variable. Removing it, and re-ordering.")
+
+                    # Remove the session from the dataset
+                    del h5f[session_id]
+
+                    # Remove from in-memory sessions list
+                    self.resort_sessions()
+
+                    # Re-load available sessions after deletion
+                    available_sessions = [k for k in h5f.keys() if k.startswith('session_')]
+
+                # Access the session group
+                session_group = h5f[session_id]    
+                                
                 # Get timestamps for this session
                 times = session_group['times'][:]
                 
@@ -187,7 +546,7 @@ class MagnetotailDataset(Dataset):
     def resort_sessions(self):
         """
         Resort sessions to remove gaps in session numbering after session removal.
-        This function renumbers sessions sequentially starting from 'session_001'.
+        This function renumbers sessions sequentially starting from 'session_0001'.
         """
         with h5py.File(self.hdf5_file, 'r+') as h5f:
             # Get all remaining session keys and sort them
@@ -330,34 +689,52 @@ class MagnetotailDataset(Dataset):
             
         result = {}
 
-        for section_key, section_indices in self.sections.items():
-            # Get the first sample to determine keys
-            sample = self[section_indices[0]]
+        print("Setting trainable samples for each section...")
 
-            # Create a list of keys excluding 'region'
-            sample_keys = list(sample.keys())
-            sample_keys.remove('region') if 'region' in sample_keys else None # Remove 'region' if it exists
-
-            # Initialize a dictionary to hold results for this section
-            section_result = {key: [] for key in sample_keys}
-
-            # Collect all values for each key in this section
-            for idx in section_indices:
-                sample = self[idx]
-                for key in section_result.keys():
-                    section_result[key].append(sample[key])
-            
-            # Convert lists to tensors for each section
-            for key in section_result.keys():
-                if isinstance(section_result[key][0], torch.Tensor):
-                    section_result[key] = torch.stack(section_result[key])
-                else:
-                    section_result[key] = section_result[key]  # Keep as list for non-tensor data
-                        # Add 'region' key to section result dict
-
-            section_result['region'] = None
-
-            result[section_key] = section_result
+        # Pre-open the HDF5 file to avoid repeated file operations
+        with h5py.File(self.hdf5_file, 'r') as h5f:
+            for section_key, section_indices in tqdm(self.sections.items()):
+                if not section_indices:
+                    continue
+                
+                # Get session info for this section (all indices should be from same session)
+                session_idx, _ = section_indices[0]
+                session_info = self.sessions[session_idx]
+                session_id = session_info['id']
+                variables = session_info['variables']
+                session_group = h5f[session_id]
+                
+                # Extract time indices for this section
+                time_indices = [time_idx for _, time_idx in section_indices]
+                
+                # Initialize section result with variables (exclude 'region')
+                section_result = {}
+                
+                # Check whether all variables are of the same length
+                expected_length = session_info['num_timestamps']
+                skipped_variables = []
+                
+                # Load data for each variable efficiently using array slicing
+                for var_name in variables:
+                    actual_length = session_group[var_name].shape[0]
+                    if actual_length != expected_length:
+                        print(f"Warning: Variable '{var_name}' has length {actual_length} but expected {expected_length} in session '{session_id}'. Skipping variable.")
+                        skipped_variables.append(var_name)
+                        self.skip_calculations = True
+                        continue
+                        
+                    var_data = session_group[var_name][time_indices]
+                    section_result[var_name] = torch.tensor(var_data, dtype=torch.float32)
+                
+                # Print summary of skipped variables if any
+                if skipped_variables:
+                    print(f"Skipped {len(skipped_variables)} variables in section '{section_key}': {skipped_variables}")
+                
+                # Add session_id and region
+                section_result['session_id'] = session_id
+                section_result['region'] = None
+                
+                result[section_key] = section_result
 
         self.trainable_samples = result
 
@@ -368,6 +745,9 @@ class MagnetotailDataset(Dataset):
                 
         #         if session_id in h5f:
         #             del h5f[session_id]
+
+        
+        
 
         return result
 
@@ -384,7 +764,7 @@ class MagnetotailDataset(Dataset):
             
             return result
 
-    def set_regions_for_sections(self, section_to_region_map=None):
+    def set_regions_for_sections(self, overwrite=True, filepath: Optional[str] = None):
         """
         Set the 'region' key for each section in trainable samples.
         
@@ -393,7 +773,7 @@ class MagnetotailDataset(Dataset):
         """
 
         # If not section to region map is given, manual assignment is performed
-        if section_to_region_map == None:
+        if overwrite:
             for section in self.trainable_samples:
 
                 # Plot the variable containing ion_eflux 
@@ -413,29 +793,102 @@ class MagnetotailDataset(Dataset):
 
                 if region in ['1', 'magnetotail']:
                     self.trainable_samples[section]['region'] = 'magnetotail'
+                    self.section_to_region_map[section] = 'magnetotail'
                 elif region in ['2', 'magnetosheath']:    
                     self.trainable_samples[section]['region'] = 'magnetosheath'
+                    self.section_to_region_map[section] = 'magnetosheath'
                 else: 
                     self.trainable_samples[section]['region'] = None
+                    self.section_to_region_map[section] = None
                     print('Due to invalid input, region was set to None')
 
         # Assignment using section to region map
         else:
-            for section_key in section_to_region_map.keys():
-                self.trainable_samples[section_key] = section_to_region_map[section_key]
+            section_to_region_map = self.get_section_to_region_map(filepath)
 
-    def get_section_to_region_map(self):
+            if not section_to_region_map:
+                raise ValueError("No section to region mapping found. Please set regions manually or ensure the mapping exists.")
+
+            for section_key in section_to_region_map.keys():
+                self.trainable_samples[section_key]['region'] = section_to_region_map[section_key]
+
+    def get_section_to_region_map(self, filepath: Optional[str] = None):
+
         """
         Get the section to region map.
         """
 
-        # Extract section to region map
-        section_to_region_map = dict()
+        if not hasattr(self, 'section_to_region_map'):
+            self.section_to_region_map = self._load_section_to_region_map(filepath)
+        
+        return self.section_to_region_map
 
-        # Loop through sections of the trainable samples
+    def get_section_times(self):
+        """
+        Get the times variable for each section in trainable samples as numpy.datetime64 array, for plotting purposes.
+
+        Returns:
+            Dict[str, np.ndarray]: Mapping of section keys to their corresponding times as numpy.datetime64 arrays.
+        """
+
+        # Set up dictionary to hold times for each section
+        times_np_dict = {}
+
+        # Loop through each section
         for section_key in self.trainable_samples.keys():
 
-            # Get the region for each section
-            section_to_region_map[section_key] = self.trainable_samples[section_key]['region']
+            # Extract times tensor
+            times_tensor = self.trainable_samples[section_key]['times']
 
-        return section_to_region_map
+            # Convert to numpy datetime64 array
+            times_np = times_tensor.numpy().astype('datetime64[ns]')
+            
+            # Store in dictionary
+            times_np_dict[section_key] = times_np
+
+        return times_np_dict
+
+    def delete_section(self, section_key, section_is_session=False):
+        """
+        Delete a section from the dataset and remove it from the HDF5 file. Delete it from the file, trainable indices, and trainable samples.
+        Parameters:
+            section_key (str): The section key to delete (e.g., 'section_001')
+        """
+
+        # Remove section from HDF5 file if stored
+        if section_is_session:
+            # From section key, get session id  
+            session_id = self.trainable_samples[section_key]['session_id']
+            print(f"Deleting entire session {session_id} from dataset.")
+            with h5py.File(self.hdf5_file, 'r+') as h5f:
+                if session_id in h5f:
+                    del h5f[session_id]
+   
+
+
+            if section_key not in self.sections:
+                raise ValueError(f"Section {section_key} not found in dataset")
+
+            # Get indices for this section
+            section_indices = self.sections[section_key]
+            section_indices_set = set(section_indices)
+            # Remove these indices from trainable_indices
+            new_trainable_indices = [idx for idx in self.trainable_indices if tuple(idx) not in section_indices_set]
+
+            self.trainable_indices = np.array(new_trainable_indices)
+
+            # Remove section from sections and trainable_samples
+            del self.sections[section_key]
+
+            if self.trainable_samples and section_key in self.trainable_samples:
+                del self.trainable_samples[section_key]
+
+            # Remove section from section_to_region_map if it exists
+            if self.section_to_region_map and section_key in self.section_to_region_map:
+                del self.section_to_region_map[section_key]
+
+        else:
+            with h5py.File(self.hdf5_file, 'r+') as h5f:
+                if section_key in h5f:
+                    del h5f[section_key]
+                    

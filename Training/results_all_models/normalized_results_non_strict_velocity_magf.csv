@@ -1,0 +1,10 @@
+Model,Window Average Error,True Positives,In range Positives,False Positives,Precision,F1 Score,TP_mean,TP_std,TP_absolute
+1_steps_velocity_magnetic_field_avg2,1,149,174,113,0.569,0.616,30,6.20,6.50
+1_steps_velocity_magnetic_field_avg2,2,136,161,84,0.618,0.617,30,6.09,6.10
+1_steps_velocity_magnetic_field_avg2,3,115,145,55,0.676,0.588,30,6.77,5.82
+1_steps_velocity_magnetic_field_avg3,1,128,154,66,0.660,0.617,30,7.23,6.65
+1_steps_velocity_magnetic_field_avg3,2,114,143,46,0.713,0.597,30,6.80,6.25
+1_steps_velocity_magnetic_field_avg3,3,111,142,37,0.750,0.600,30,7.74,6.78
+1_steps_velocity_magnetic_field_avg4,1,108,135,34,0.761,0.592,30,8.90,6.74
+1_steps_velocity_magnetic_field_avg4,2,98,131,26,0.790,0.565,30,8.77,6.23
+1_steps_velocity_magnetic_field_avg4,3,91,123,21,0.812,0.545,30,8.97,6.91
